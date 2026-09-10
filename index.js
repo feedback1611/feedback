@@ -1190,6 +1190,57 @@ authRouter.post('/reset-password', passwordResetLimiter, async (req, res, next) 
   }
 });
 
+/**
+ * POST /api/auth/setup-admin
+ * One-time setup endpoint: only succeeds if NO Super Admin exists in the database
+ */
+authRouter.post('/setup-admin', async (req, res, next) => {
+  try {
+    const adminCount = await User.countDocuments({ role: 'SUPER_ADMIN' });
+    if (adminCount > 0) {
+      return res.status(403).json({
+        success: false,
+        error: 'Super Admin account has already been initialized.'
+      });
+    }
+
+    const { name, email, username, password } = req.body;
+    if (!name || !email || !username || !password || password.length < 8) {
+      return res.status(400).json({
+        success: false,
+        error: 'name, email, username, and a password of at least 8 characters are required.'
+      });
+    }
+
+    const passwordHash = await hashPassword(password);
+    const superAdmin = new User({
+      name: name.trim(),
+      email: email.toLowerCase().trim(),
+      username: username.toLowerCase().trim(),
+      passwordHash,
+      role: 'SUPER_ADMIN',
+      department: 'Administration',
+      isActive: true
+    });
+
+    await superAdmin.save();
+
+    res.status(201).json({
+      success: true,
+      message: 'Super Admin initialized successfully. You may now log in.',
+      user: {
+        id: superAdmin._id,
+        name: superAdmin.name,
+        email: superAdmin.email,
+        username: superAdmin.username,
+        role: superAdmin.role
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.use('/api/auth', authRouter);
 
 // ============================================================================
@@ -1842,15 +1893,61 @@ app.use((err, req, res, next) => {
 // ============================================================================
 // 16. SERVER STARTUP & GRACEFUL SHUTDOWN
 // ============================================================================
-let server = null;
+async function seedDefaultSuperAdmin() {
+  try {
+    const adminCount = await User.countDocuments({ role: 'SUPER_ADMIN' });
+    if (adminCount === 0) {
+      const email = (process.env.SUPER_ADMIN_EMAIL || 'admin@college.edu').toLowerCase().trim();
+      const username = (process.env.SUPER_ADMIN_USERNAME || 'superadmin').toLowerCase().trim();
+      const password = process.env.SUPER_ADMIN_PASSWORD || 'SuperAdmin@123';
+      const passwordHash = await hashPassword(password);
+
+      const superAdmin = new User({
+        name: 'College Super Admin',
+        email,
+        username,
+        passwordHash,
+        role: 'SUPER_ADMIN',
+        department: 'Administration',
+        isActive: true
+      });
+
+      await superAdmin.save();
+      console.log('================================================================');
+      console.log('[SEED] Initial Super Admin account created:');
+      console.log(`  Username: ${username}`);
+      console.log(`  Email:    ${email}`);
+      console.log(`  Password: ${password}`);
+      console.log('  Please log in and change your password if desired.');
+      console.log('================================================================');
+    }
+  } catch (seedErr) {
+    console.warn('[SEED WARNING] Could not seed default Super Admin:', seedErr.message);
+  }
+}
 
 async function startServer() {
   try {
-    console.log('[STARTUP] Connecting to MongoDB Atlas...');
+    if (!process.env.MONGODB_URI) {
+      console.error('================================================================');
+      console.error('[CONFIG CRITICAL] MONGODB_URI is NOT defined in Environment Variables!');
+      console.error('If deploying on Render, go to Render Dashboard -> Environment -> Add Environment Variable:');
+      console.error('Key: MONGODB_URI');
+      console.error('Value: mongodb+srv://<username>:<password>@cluster0.mongodb.net/college_feedback?retryWrites=true&w=majority');
+      console.error('================================================================');
+    }
+
+    // Mask password in logs for safety
+    const maskedUri = MONGODB_URI.replace(/\/\/([^:]+):([^@]+)@/, '//$1:****@');
+    console.log(`[STARTUP] Connecting to MongoDB (${maskedUri})...`);
+
     await mongoose.connect(MONGODB_URI, {
       serverSelectionTimeoutMS: 10000
     });
     console.log('[STARTUP] Connected to MongoDB Atlas successfully.');
+
+    // Seed default Super Admin account if no Super Admin exists yet
+    await seedDefaultSuperAdmin();
 
     // Bind to 0.0.0.0 and PORT for compatibility with Render
     server = app.listen(PORT, '0.0.0.0', () => {
@@ -1859,8 +1956,20 @@ async function startServer() {
       console.log(`[STARTUP] Healthcheck: http://0.0.0.0:${PORT}/api/health`);
     });
   } catch (err) {
-    console.error('[STARTUP FATAL ERROR] Failed to connect to MongoDB:', err.message);
-    process.exit(1);
+    console.error('================================================================');
+    console.error('[STARTUP FATAL ERROR] Failed to connect to MongoDB:');
+    console.error(err.message);
+    console.error('----------------------------------------------------------------');
+    console.error('COMMON REASONS FOR THIS ERROR ON RENDER:');
+    console.error('1. MONGODB ATLAS IP WHITELIST (Most Common):');
+    console.error('   Render uses dynamic IP addresses. In MongoDB Atlas:');
+    console.error('   Go to Network Access -> Add IP Address -> Select "Allow Access From Anywhere" (0.0.0.0/0).');
+    console.error('2. WRONG USERNAME OR PASSWORD:');
+    console.error('   Ensure your MongoDB database user password is correct and contains no unencoded special characters.');
+    console.error('3. MISSING MONGODB_URI IN RENDER:');
+    console.error('   Make sure MONGODB_URI is configured in Render Dashboard -> Environment.');
+    console.error('================================================================');
+    setTimeout(() => process.exit(1), 500);
   }
 }
 
@@ -1900,3 +2009,30 @@ process.on('uncaughtException', (error) => {
 // Start the application
 startServer();
 
+// ============================================================================
+// 17. ENVIRONMENT VARIABLES TEMPLATE & CONFIGURATION GUIDE
+// ============================================================================
+/*
+To deploy to Render or run locally, set the following environment variables in
+Render Dashboard -> Environment or in a local .env file:
+
+PORT=5000
+NODE_ENV=production
+MONGODB_URI=mongodb+srv://<username>:<password>@cluster0.mongodb.net/college_feedback?retryWrites=true&w=majority
+AUTH_SECRET=a_long_cryptographically_secure_random_string_for_jwt_signing
+GMAIL_USER=your_college_notifications@gmail.com
+GMAIL_APP_PASSWORD=xxxx_xxxx_xxxx_xxxx
+STUDENT_FRONTEND_URL=https://your-student-feedback-ui.onrender.com
+COLLEGE_NAME=St. Xavier's College of Engineering
+
+NOTES:
+1. GMAIL_APP_PASSWORD:
+   - Must be a 16-character Google App Password (not standard Gmail password).
+   - Generated at: Google Account -> Security -> 2-Step Verification -> App Passwords.
+2. AUTH_SECRET:
+   - Generate using: node -e "console.log(require('crypto').randomBytes(64).toString('hex'))"
+3. Render Deployment:
+   - Build Command: npm install
+   - Start Command: npm start
+   - Health Check Path: /api/health
+*/
