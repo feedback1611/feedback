@@ -1363,6 +1363,182 @@ adminRouter.patch('/hods/:id/status', async (req, res, next) => {
   }
 });
 
+/**
+ * PATCH /api/admin/hods/:id
+ * Super Admin edits an HOD's details (name, email, username, department, or resets password)
+ */
+adminRouter.patch('/hods/:id', async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ success: false, error: 'Invalid HOD ID format' });
+    }
+
+    const hod = await User.findOne({ _id: id, role: 'HOD' });
+    if (!hod) {
+      return res.status(404).json({ success: false, error: 'HOD account not found' });
+    }
+
+    const { name, email, username, department, password } = req.body;
+
+    if (email && email.toLowerCase().trim() !== hod.email) {
+      const cleanEmail = email.toLowerCase().trim();
+      const existingEmail = await User.findOne({ email: cleanEmail, _id: { $ne: hod._id } });
+      if (existingEmail) {
+        return res.status(409).json({ success: false, error: 'A user with this email address already exists.' });
+      }
+      hod.email = cleanEmail;
+    }
+
+    if (username && username.toLowerCase().trim() !== hod.username) {
+      const cleanUsername = username.toLowerCase().trim();
+      if (!/^[a-zA-Z0-9_.-]{3,30}$/.test(cleanUsername)) {
+        return res.status(400).json({
+          success: false,
+          error: 'Username must be 3-30 characters and contain only letters, numbers, underscores, dots, and hyphens.'
+        });
+      }
+      const existingUsername = await User.findOne({ username: cleanUsername, _id: { $ne: hod._id } });
+      if (existingUsername) {
+        return res.status(409).json({ success: false, error: 'A user with this username already exists.' });
+      }
+      hod.username = cleanUsername;
+    }
+
+    if (name && name.trim()) {
+      hod.name = name.trim();
+    }
+
+    if (department && department.trim()) {
+      hod.department = department.trim();
+    }
+
+    if (password) {
+      if (password.length < 8) {
+        return res.status(400).json({ success: false, error: 'New password must be at least 8 characters long.' });
+      }
+      hod.passwordHash = await hashPassword(password);
+    }
+
+    await hod.save();
+
+    res.status(200).json({
+      success: true,
+      message: 'HOD account updated successfully',
+      hod
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * DELETE /api/admin/hods/:id
+ * Super Admin deletes an HOD account and cleans up associated forms
+ */
+adminRouter.delete('/hods/:id', async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ success: false, error: 'Invalid HOD ID format' });
+    }
+
+    const hod = await User.findOne({ _id: id, role: 'HOD' });
+    if (!hod) {
+      return res.status(404).json({ success: false, error: 'HOD account not found' });
+    }
+
+    // Clean up forms created by this HOD
+    await FeedbackForm.deleteMany({ hodId: id });
+    await User.deleteOne({ _id: id });
+
+    res.status(200).json({
+      success: true,
+      message: `HOD '${hod.name}' and all associated feedback forms have been deleted successfully.`
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * PATCH /api/admin/profile
+ * Super Admin updates their own profile credentials (name, email, username, and password)
+ */
+adminRouter.patch('/profile', async (req, res, next) => {
+  try {
+    const user = await User.findById(req.user._id);
+    if (!user || user.role !== 'SUPER_ADMIN') {
+      return res.status(403).json({ success: false, error: 'Access denied: Must be SUPER_ADMIN.' });
+    }
+
+    const { name, email, username, currentPassword, newPassword } = req.body;
+
+    if (email && email.toLowerCase().trim() !== user.email) {
+      const cleanEmail = email.toLowerCase().trim();
+      const existingEmail = await User.findOne({ email: cleanEmail, _id: { $ne: user._id } });
+      if (existingEmail) {
+        return res.status(409).json({ success: false, error: 'A user with this email address already exists.' });
+      }
+      user.email = cleanEmail;
+    }
+
+    if (username && username.toLowerCase().trim() !== user.username) {
+      const cleanUsername = username.toLowerCase().trim();
+      if (!/^[a-zA-Z0-9_.-]{3,30}$/.test(cleanUsername)) {
+        return res.status(400).json({
+          success: false,
+          error: 'Username must be 3-30 characters (letters, numbers, _, -, .).'
+        });
+      }
+      const existingUsername = await User.findOne({ username: cleanUsername, _id: { $ne: user._id } });
+      if (existingUsername) {
+        return res.status(409).json({ success: false, error: 'A user with this username already exists.' });
+      }
+      user.username = cleanUsername;
+    }
+
+    if (name && name.trim()) {
+      user.name = name.trim();
+    }
+
+    if (newPassword) {
+      if (newPassword.length < 8) {
+        return res.status(400).json({ success: false, error: 'New password must be at least 8 characters long.' });
+      }
+      if (currentPassword) {
+        const isMatch = await verifyPassword(currentPassword, user.passwordHash);
+        if (!isMatch) {
+          return res.status(400).json({ success: false, error: 'Current password does not match.' });
+        }
+      }
+      user.passwordHash = await hashPassword(newPassword);
+    }
+
+    await user.save();
+
+    // Re-issue new JWT token with updated credentials
+    const newToken = generateJwtToken(user);
+    setAuthCookie(res, newToken);
+
+    res.status(200).json({
+      success: true,
+      message: 'Super Admin credentials updated successfully.',
+      token: newToken,
+      user: {
+        id: user._id,
+        name: user.name,
+        email: user.email,
+        username: user.username,
+        role: user.role,
+        department: user.department
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.use('/api/admin', adminRouter);
 
 // ============================================================================
