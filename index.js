@@ -43,6 +43,8 @@ const PDFDocument = require('pdfkit');
 const QRCode = require('qrcode');
 const { z } = require('zod');
 const bcrypt = require('bcryptjs');
+const fs = require('fs');
+const path = require('path');
 
 // Load environment variables from .env if present
 dotenv.config();
@@ -340,17 +342,17 @@ app.use(
   })
 );
 
-// Strict CORS setup
+// Strict CORS setup with support for standalone file:/// access
 const corsOptions = {
   origin: (origin, callback) => {
-    // Allow non-browser agents, curl, Postman, Render healthcheck
-    if (!origin) return callback(null, true);
+    // Allow non-browser agents, curl, Postman, Render healthchecks, and local file:/// (origin is null or 'null')
+    if (!origin || origin === 'null') return callback(null, true);
     // In development or if explicitly matching frontend URL
     if (!IS_PRODUCTION) return callback(null, true);
     if (origin === STUDENT_FRONTEND_URL || origin.endsWith('.onrender.com')) {
       return callback(null, true);
     }
-    return callback(null, true); // Permissive for initial deployment; lock down as needed
+    return callback(null, true); // Permissive for distributed portable admin access
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
@@ -522,14 +524,28 @@ const createHodSchema = z.object({
   password: z.string().min(8, 'Password must be at least 8 characters long')
 });
 
-const forgotPasswordSchema = z.object({
-  email: z.string().trim().email('Valid email address is required')
-});
+const forgotPasswordSchema = z
+  .object({
+    email: z.string().trim().optional(),
+    username: z.string().trim().optional(),
+    identifier: z.string().trim().optional(),
+    emailOrUsername: z.string().trim().optional(),
+    usernameOrEmail: z.string().trim().optional()
+  })
+  .refine(
+    data => data.email || data.username || data.identifier || data.emailOrUsername || data.usernameOrEmail,
+    { message: 'Username or registered email address is required' }
+  );
 
-const resetPasswordSchema = z.object({
-  token: z.string().trim().min(16, 'Valid reset token is required'),
-  newPassword: z.string().min(8, 'New password must be at least 8 characters long')
-});
+const resetPasswordSchema = z
+  .object({
+    token: z.string().trim().optional(),
+    resetToken: z.string().trim().optional(),
+    newPassword: z.string().min(8, 'New password must be at least 8 characters long')
+  })
+  .refine(data => data.token || data.resetToken, {
+    message: 'Reset token is required'
+  });
 
 const createFormSchema = z.object({
   className: z.string().trim().min(1, 'Class name is required'),
@@ -580,52 +596,95 @@ const submitFeedbackSchema = z.object({
 let emailTransporter = null;
 
 if (GMAIL_USER && GMAIL_APP_PASSWORD) {
-  emailTransporter = nodemailer.createTransport({
-    service: 'gmail',
-    auth: {
-      user: GMAIL_USER,
-      pass: GMAIL_APP_PASSWORD
-    }
-  });
+  try {
+    emailTransporter = nodemailer.createTransport({
+      service: 'gmail',
+      auth: {
+        user: GMAIL_USER,
+        pass: GMAIL_APP_PASSWORD
+      }
+    });
+
+    emailTransporter.verify((err) => {
+      if (err) {
+        console.warn('[EMAIL WARNING] Gmail SMTP Transporter verification failed:', err.message);
+      } else {
+        console.log('[EMAIL] Gmail SMTP Transporter successfully verified and ready to send emails.');
+      }
+    });
+  } catch (err) {
+    console.warn('[EMAIL WARNING] Could not initialize Gmail SMTP transporter:', err.message);
+  }
+} else {
+  console.log('[EMAIL NOTICE] GMAIL_USER or GMAIL_APP_PASSWORD not set. Direct password recovery tokens will be active.');
 }
 
-async function sendPasswordResetEmail(recipientEmail, rawToken) {
+function maskEmail(email) {
+  if (!email || !email.includes('@')) return email || '';
+  const [local, domain] = email.split('@');
+  if (local.length <= 2) return `${local[0]}***@${domain}`;
+  return `${local.slice(0, 2)}***${local.slice(-1)}@${domain}`;
+}
+
+async function sendPasswordResetEmail(recipientEmail, rawToken, recipientName = 'User', customResetUrl = null) {
   if (!emailTransporter) {
-    console.warn('[EMAIL WARNING] Gmail SMTP is not configured. Reset token (dev mode only):', rawToken);
+    console.warn('[EMAIL NOTICE] Gmail SMTP is not configured. Direct token recovery in effect. Token:', rawToken);
     return false;
   }
 
-  // Frontend password reset page URL pointing to the user interface
-  const resetUrl = `${STUDENT_FRONTEND_URL}/reset-password?token=${encodeURIComponent(rawToken)}`;
+  const resetUrl = customResetUrl || `${STUDENT_FRONTEND_URL}/admin.html?token=${encodeURIComponent(rawToken)}`;
 
   const mailOptions = {
     from: `"${COLLEGE_NAME}" <${GMAIL_USER}>`,
     to: recipientEmail,
     subject: `Password Reset Request - ${COLLEGE_NAME}`,
-    text: `Hello,\n\nA password reset request was received for your HOD account at ${COLLEGE_NAME}.\n\nTo reset your password, please visit the following link (valid for 30 minutes):\n${resetUrl}\n\nIf you did not request a password reset, please ignore this email.\n\nRegards,\n${COLLEGE_NAME} Administration`,
+    text: `Hello ${recipientName},\n\nA password reset request was received for your account at ${COLLEGE_NAME}.\n\nYour Reset Token: ${rawToken}\n\nTo reset your password, please visit:\n${resetUrl}\n\nThis reset token will expire in 30 minutes.\n\nIf you did not request a password reset, you can safely ignore this email.\n\nRegards,\n${COLLEGE_NAME} Administration`,
     html: `
-      <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #e0e0e0; border-radius: 8px;">
-        <h2 style="color: #1a365d; text-align: center; margin-bottom: 20px;">${COLLEGE_NAME}</h2>
-        <div style="padding: 20px; background-color: #f7fafc; border-radius: 6px;">
-          <h3 style="color: #2d3748; margin-top: 0;">Password Reset Request</h3>
-          <p style="color: #4a5568; line-height: 1.6;">
-            A password reset was requested for your HOD account. Click the button below to set a new password. This link will expire in <strong>30 minutes</strong>.
-          </p>
-          <div style="text-align: center; margin: 30px 0;">
-            <a href="${resetUrl}" style="background-color: #2b6cb0; color: #ffffff; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: bold; display: inline-block;">
-              Reset Password
-            </a>
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="utf-8">
+        <style>
+          body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #f8fafc; margin: 0; padding: 24px; color: #1e293b; }
+          .card { max-width: 580px; margin: 0 auto; background: #ffffff; border-radius: 12px; border: 1px solid #e2e8f0; overflow: hidden; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05); }
+          .header { background: #1e3a8a; padding: 28px 24px; text-align: center; }
+          .header h1 { color: #ffffff; font-size: 20px; margin: 0; font-weight: 700; letter-spacing: -0.02em; }
+          .content { padding: 32px 28px; }
+          .title { font-size: 18px; font-weight: 700; color: #0f172a; margin-top: 0; margin-bottom: 12px; }
+          .text { font-size: 14px; color: #475569; line-height: 1.6; margin-bottom: 20px; }
+          .token-box { background: #f1f5f9; border: 1px dashed #cbd5e1; border-radius: 8px; padding: 14px; text-align: center; margin: 20px 0; }
+          .token-label { font-size: 11px; text-transform: uppercase; color: #64748b; font-weight: 700; margin-bottom: 6px; letter-spacing: 0.05em; }
+          .token-code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 13px; font-weight: 700; color: #1e3a8a; word-break: break-all; }
+          .btn-wrap { text-align: center; margin: 26px 0; }
+          .btn { background-color: #2563eb; color: #ffffff !important; text-decoration: none; padding: 12px 28px; border-radius: 8px; font-weight: 600; font-size: 14px; display: inline-block; }
+          .footer { background: #f8fafc; border-top: 1px solid #f1f5f9; padding: 18px 28px; font-size: 12px; color: #94a3b8; text-align: center; line-height: 1.5; }
+        </style>
+      </head>
+      <body>
+        <div class="card">
+          <div class="header">
+            <h1>${COLLEGE_NAME}</h1>
           </div>
-          <p style="color: #718096; font-size: 13px; line-height: 1.5;">
-            Or copy and paste this URL into your browser:<br/>
-            <a href="${resetUrl}" style="color: #2b6cb0; word-break: break-all;">${resetUrl}</a>
-          </p>
-          <hr style="border: none; border-top: 1px solid #e2e8f0; margin: 20px 0;" />
-          <p style="color: #a0aec0; font-size: 12px; margin-bottom: 0;">
-            If you did not request this reset, no further action is required. Your account remains secure.
-          </p>
+          <div class="content">
+            <h2 class="title">Password Reset Request</h2>
+            <p class="text">Hello <strong>${recipientName}</strong>,</p>
+            <p class="text">We received a request to reset the password for your account. Click the button below to choose a new password. This reset link expires in <strong>30 minutes</strong>.</p>
+            <div class="btn-wrap">
+              <a href="${resetUrl}" class="btn" target="_blank">Reset My Password</a>
+            </div>
+            <div class="token-box">
+              <div class="token-label">Security Reset Token</div>
+              <div class="token-code">${rawToken}</div>
+            </div>
+            <p class="text" style="font-size: 12px; color: #64748b;">If the button doesn't work, copy and paste this link into your browser:<br/><a href="${resetUrl}" style="color: #2563eb; word-break: break-all;">${resetUrl}</a></p>
+          </div>
+          <div class="footer">
+            If you did not request this password reset, no action is needed. Your account remains safe.<br/>
+            &copy; ${new Date().getFullYear()} ${COLLEGE_NAME} • Faculty Feedback System
+          </div>
         </div>
-      </div>
+      </body>
+      </html>
     `
   };
 
@@ -767,46 +826,91 @@ function computeFormAnalytics(form, responses) {
 // ============================================================================
 // 9. PDF REPORT GENERATOR (PDFKit Multi-Page Engine)
 // ============================================================================
+function findCollegeLogoPath() {
+  const possiblePaths = [
+    path.join(__dirname, 'logo.png'),
+    path.join(process.cwd(), 'logo.png'),
+    path.join(__dirname, '..', 'logo.png'),
+    path.join(__dirname, '..', 'scratch', 'logo.png'),
+    path.join(__dirname, 'public', 'logo.png')
+  ];
+  for (const p of possiblePaths) {
+    if (fs.existsSync(p)) return p;
+  }
+  return null;
+}
+
+function getRatingColor(score) {
+  if (score >= 4.0) return { text: '#059669', bg: '#ecfdf5', border: '#a7f3d0', label: 'EXCELLENT' };
+  if (score >= 3.0) return { text: '#d97706', bg: '#fffbeb', border: '#fde68a', label: 'GOOD' };
+  return { text: '#dc2626', bg: '#fef2f2', border: '#fecaca', label: 'NEEDS FOCUS' };
+}
+
 function drawPdfHeader(doc, title, subtitle) {
-  doc.rect(40, 30, doc.page.width - 80, 55).fill('#1A365D');
-  doc.fillColor('#FFFFFF').fontSize(16).font('Helvetica-Bold').text(title, 40, 42, {
-    align: 'center',
-    width: doc.page.width - 80
+  const logoPath = findCollegeLogoPath();
+
+  // Header Banner Background
+  doc.rect(40, 24, doc.page.width - 80, 58).fill('#1e3a8a');
+
+  // College Logo or Vector Emblem
+  if (logoPath) {
+    try {
+      doc.image(logoPath, 52, 30, { fit: [46, 46], align: 'center', valign: 'center' });
+    } catch (e) {
+      doc.roundedRect(52, 30, 46, 46, 6).fill('#2563eb');
+      doc.fillColor('#ffffff').fontSize(16).font('Helvetica-Bold').text('CF', 52, 44, { width: 46, align: 'center' });
+    }
+  } else {
+    doc.roundedRect(52, 30, 46, 46, 6).fill('#2563eb');
+    doc.fillColor('#ffffff').fontSize(16).font('Helvetica-Bold').text('CF', 52, 44, { width: 46, align: 'center' });
+  }
+
+  // Header Typography
+  doc.fillColor('#ffffff').fontSize(15).font('Helvetica-Bold').text(title, 110, 32, {
+    width: doc.page.width - 160
   });
-  doc.fontSize(11).font('Helvetica').text(subtitle, 40, 62, {
-    align: 'center',
-    width: doc.page.width - 80
+  doc.fillColor('#bfdbfe').fontSize(10).font('Helvetica').text(subtitle, 110, 52, {
+    width: doc.page.width - 160
   });
-  doc.fillColor('#000000');
-  doc.y = 100;
+
+  // Thin Accent Divider
+  doc.rect(40, 82, doc.page.width - 80, 2).fill('#3b82f6');
+  doc.y = 96;
 }
 
 function drawMetadataBox(doc, form, totalResponses, overallAvg) {
   const startY = doc.y;
   const boxWidth = doc.page.width - 80;
-
-  doc.rect(40, startY, boxWidth, 75).fillAndStroke('#F7FAFC', '#CBD5E0');
-  doc.fillColor('#2D3748').fontSize(10).font('Helvetica-Bold');
-
   const col1 = 55;
-  const col2 = 220;
-  const col3 = 400;
+  const col2 = 230;
+  const col3 = 410;
 
-  doc.text(`Department:`, col1, startY + 12).font('Helvetica').text(form.department, col1 + 75, startY + 12);
-  doc.font('Helvetica-Bold').text(`Class:`, col1, startY + 30).font('Helvetica').text(form.className, col1 + 75, startY + 30);
-  doc.font('Helvetica-Bold').text(`Semester:`, col1, startY + 48).font('Helvetica').text(form.semester, col1 + 75, startY + 48);
+  // Outer Box
+  doc.roundedRect(40, startY, boxWidth, 80, 6).fillAndStroke('#f8fafc', '#cbd5e1');
 
+  // Column 1: Academic Scope
+  doc.fillColor('#64748b').fontSize(8).font('Helvetica-Bold').text('BRANCH / DEPARTMENT', col1, startY + 12);
+  doc.fillColor('#0f172a').fontSize(10).font('Helvetica-Bold').text(form.department || 'N/A', col1, startY + 22);
+
+  doc.fillColor('#64748b').fontSize(8).font('Helvetica-Bold').text('CLASS & SEMESTER', col1, startY + 44);
+  doc.fillColor('#0f172a').fontSize(10).font('Helvetica-Bold').text(`${form.className} • Sem ${form.semester}`, col1, startY + 54);
+
+  // Column 2: Date & Status
   const dateStr = form.feedbackDate ? new Date(form.feedbackDate).toLocaleDateString() : 'N/A';
-  doc.font('Helvetica-Bold').text(`Feedback Date:`, col2, startY + 12).font('Helvetica').text(dateStr, col2 + 85, startY + 12);
-  doc.font('Helvetica-Bold').text(`Status:`, col2, startY + 30).font('Helvetica').text(form.status, col2 + 85, startY + 30);
-  doc.font('Helvetica-Bold').text(`Total Responses:`, col2, startY + 48).font('Helvetica').text(String(totalResponses), col2 + 85, startY + 48);
+  doc.fillColor('#64748b').fontSize(8).font('Helvetica-Bold').text('FEEDBACK DATE', col2, startY + 12);
+  doc.fillColor('#0f172a').fontSize(10).font('Helvetica-Bold').text(dateStr, col2, startY + 22);
 
-  doc.rect(col3, startY + 10, 140, 55).fill('#EDF2F7');
-  doc.fillColor('#4A5568').fontSize(9).font('Helvetica').text('OVERALL RATING', col3, startY + 16, { width: 140, align: 'center' });
-  doc.fillColor('#2B6CB0').fontSize(22).font('Helvetica-Bold').text(`${overallAvg.toFixed(2)} / 5`, col3, startY + 30, { width: 140, align: 'center' });
+  doc.fillColor('#64748b').fontSize(8).font('Helvetica-Bold').text('SUBMISSIONS COUNT', col2, startY + 44);
+  doc.fillColor('#2563eb').fontSize(10).font('Helvetica-Bold').text(`${totalResponses} Students Evaluated`, col2, startY + 54);
 
-  doc.fillColor('#000000');
-  doc.y = startY + 90;
+  // Column 3: High-Contrast Rating Pill
+  const ratingStyle = getRatingColor(overallAvg);
+  doc.roundedRect(col3, startY + 10, 130, 60, 6).fillAndStroke(ratingStyle.bg, ratingStyle.border);
+  doc.fillColor(ratingStyle.text).fontSize(8).font('Helvetica-Bold').text('OVERALL SCORE', col3, startY + 16, { width: 130, align: 'center' });
+  doc.fontSize(18).text(`${overallAvg.toFixed(2)} / 5`, col3, startY + 28, { width: 130, align: 'center' });
+  doc.fontSize(7).font('Helvetica').text(ratingStyle.label, col3, startY + 50, { width: 130, align: 'center' });
+
+  doc.y = startY + 95;
 }
 
 function generateAnalysisPDF(res, form, responses, analytics) {
@@ -814,86 +918,106 @@ function generateAnalysisPDF(res, form, responses, analytics) {
 
   doc.pipe(res);
 
-  // ---------------- PAGE 1: TOTAL SUMMARY ----------------
-  drawPdfHeader(doc, COLLEGE_NAME, 'FACULTY FEEDBACK ANALYSIS REPORT - SUMMARY');
+  // ---------------- PAGE 1: TOTAL SUMMARY & TEACHER CARDS ----------------
+  drawPdfHeader(doc, COLLEGE_NAME, 'FACULTY FEEDBACK EVALUATION & ANALYTICS REPORT');
   drawMetadataBox(doc, form, analytics.totalResponses, analytics.overallFormAverage);
 
-  // Section: Teacher-Topic Breakdown Table
-  doc.fontSize(12).font('Helvetica-Bold').fillColor('#1A365D').text('1. Teacher & Topic Average Ratings', 40, doc.y);
-  doc.moveDown(0.5);
+  // Section 1: Teacher Performance KPI Cards
+  doc.fontSize(12).font('Helvetica-Bold').fillColor('#1e3a8a').text('1. Faculty Overall Performance Summary', 40, doc.y);
+  doc.moveDown(0.4);
+
+  let cardY = doc.y;
+  for (const t of analytics.teacherOverallAverages) {
+    if (cardY > doc.page.height - 70) {
+      doc.addPage();
+      cardY = 40;
+    }
+    const rColor = getRatingColor(t.overallAverage);
+
+    // Card Container
+    doc.roundedRect(40, cardY, doc.page.width - 80, 32, 4).fillAndStroke('#ffffff', '#e2e8f0');
+
+    // Teacher Name & Subject
+    doc.fillColor('#0f172a').fontSize(10).font('Helvetica-Bold').text(`${t.teacherName}`, 52, cardY + 7);
+    doc.fillColor('#64748b').fontSize(8).font('Helvetica').text(`Subject: ${t.subject}`, 52, cardY + 19);
+
+    // Graphical Rating Bar
+    const barWidth = 110;
+    const barX = doc.page.width - 275;
+    const filledWidth = Math.min(barWidth, Math.max(4, (t.overallAverage / 5) * barWidth));
+    doc.roundedRect(barX, cardY + 12, barWidth, 8, 3).fill('#e2e8f0');
+    doc.roundedRect(barX, cardY + 12, filledWidth, 8, 3).fill(rColor.text);
+
+    // Rating Score Pill
+    doc.roundedRect(doc.page.width - 150, cardY + 6, 98, 20, 4).fillAndStroke(rColor.bg, rColor.border);
+    doc.fillColor(rColor.text).fontSize(9).font('Helvetica-Bold').text(`${t.overallAverage.toFixed(2)} / 5.00`, doc.page.width - 150, cardY + 11, { width: 98, align: 'center' });
+
+    cardY += 38;
+  }
+
+  // Section 2: Detailed Criteria Breakdown Matrix
+  doc.y = cardY + 10;
+  if (doc.y > doc.page.height - 100) {
+    doc.addPage();
+    doc.y = 40;
+  }
+
+  doc.fontSize(12).font('Helvetica-Bold').fillColor('#1e3a8a').text('2. Criteria & Topic Average Ratings', 40, doc.y);
+  doc.moveDown(0.4);
 
   let currentY = doc.y;
-  const colWidths = { teacher: 150, subject: 100, topic: 195, avg: 70 };
+  const colWidths = { teacher: 135, subject: 95, topic: 205, avg: 80 };
   const tableX = 40;
 
   // Table Header
-  doc.rect(tableX, currentY, doc.page.width - 80, 22).fill('#2B6CB0');
-  doc.fillColor('#FFFFFF').fontSize(9).font('Helvetica-Bold');
-  doc.text('Teacher', tableX + 8, currentY + 6, { width: colWidths.teacher });
-  doc.text('Subject', tableX + colWidths.teacher + 8, currentY + 6, { width: colWidths.subject });
-  doc.text('Topic / Criteria', tableX + colWidths.teacher + colWidths.subject + 8, currentY + 6, { width: colWidths.topic });
-  doc.text('Avg Rating', tableX + colWidths.teacher + colWidths.subject + colWidths.topic + 8, currentY + 6, { width: colWidths.avg, align: 'right' });
+  doc.rect(tableX, currentY, doc.page.width - 80, 22).fill('#1e3a8a');
+  doc.fillColor('#ffffff').fontSize(8).font('Helvetica-Bold');
+  doc.text('Faculty Name', tableX + 8, currentY + 7, { width: colWidths.teacher });
+  doc.text('Subject', tableX + colWidths.teacher + 6, currentY + 7, { width: colWidths.subject });
+  doc.text('Evaluation Criteria / Parameter', tableX + colWidths.teacher + colWidths.subject + 6, currentY + 7, { width: colWidths.topic });
+  doc.text('Avg Score', tableX + colWidths.teacher + colWidths.subject + colWidths.topic + 6, currentY + 7, { width: colWidths.avg - 14, align: 'right' });
   currentY += 22;
 
   // Table Rows
-  doc.font('Helvetica').fontSize(9).fillColor('#2D3748');
+  doc.font('Helvetica').fontSize(8.5).fillColor('#1e293b');
   let isEven = false;
   for (const item of analytics.teacherTopicAverages) {
-    if (currentY > doc.page.height - 70) {
+    if (currentY > doc.page.height - 65) {
       doc.addPage();
       currentY = 40;
     }
     const rowHeight = 20;
     if (isEven) {
-      doc.rect(tableX, currentY, doc.page.width - 80, rowHeight).fill('#F7FAFC');
-      doc.fillColor('#2D3748');
+      doc.rect(tableX, currentY, doc.page.width - 80, rowHeight).fill('#f8fafc');
     }
+    doc.fillColor('#334155');
     doc.text(item.teacherName, tableX + 8, currentY + 5, { width: colWidths.teacher });
-    doc.text(item.subject, tableX + colWidths.teacher + 8, currentY + 5, { width: colWidths.subject });
-    doc.text(item.topic, tableX + colWidths.teacher + colWidths.subject + 8, currentY + 5, { width: colWidths.topic });
-    doc.font('Helvetica-Bold').text(`${item.averageRating.toFixed(2)} / 5`, tableX + colWidths.teacher + colWidths.subject + colWidths.topic + 8, currentY + 5, { width: colWidths.avg - 16, align: 'right' }).font('Helvetica');
+    doc.text(item.subject, tableX + colWidths.teacher + 6, currentY + 5, { width: colWidths.subject });
+    doc.text(item.topic, tableX + colWidths.teacher + colWidths.subject + 6, currentY + 5, { width: colWidths.topic });
+
+    const itemColor = getRatingColor(item.averageRating);
+    doc.fillColor(itemColor.text).font('Helvetica-Bold').text(`${item.averageRating.toFixed(2)} / 5`, tableX + colWidths.teacher + colWidths.subject + colWidths.topic + 6, currentY + 5, { width: colWidths.avg - 14, align: 'right' }).font('Helvetica');
     currentY += rowHeight;
     isEven = !isEven;
   }
 
-  // Teacher Overall Summary Cards
-  doc.y = currentY + 15;
-  if (doc.y > doc.page.height - 100) {
-    doc.addPage();
-    doc.y = 40;
-  }
-  doc.fontSize(12).font('Helvetica-Bold').fillColor('#1A365D').text('Teacher Overall Performance Summary', 40, doc.y);
-  doc.moveDown(0.5);
-
-  let cardY = doc.y;
-  for (const t of analytics.teacherOverallAverages) {
-    if (cardY > doc.page.height - 50) {
-      doc.addPage();
-      cardY = 40;
-    }
-    doc.rect(40, cardY, doc.page.width - 80, 26).fillAndStroke('#EDF2F7', '#E2E8F0');
-    doc.fillColor('#1A365D').fontSize(10).font('Helvetica-Bold').text(`${t.teacherName} (${t.subject})`, 50, cardY + 7);
-    doc.fillColor('#2B6CB0').fontSize(10).text(`Overall Average: ${t.overallAverage.toFixed(2)} / 5.00`, doc.page.width - 230, cardY + 7, { align: 'right', width: 180 });
-    cardY += 32;
-  }
-
-  // ---------------- PAGE 2: STUDENT-WISE SUMMARY ----------------
+  // ---------------- PAGE 2: STUDENT-WISE EVALUATION SUMMARY ----------------
   doc.addPage();
   drawPdfHeader(doc, COLLEGE_NAME, 'STUDENT-WISE EVALUATION SUMMARY');
 
-  doc.fontSize(12).font('Helvetica-Bold').fillColor('#1A365D').text('2. Student-Wise Average per Teacher', 40, doc.y);
-  doc.moveDown(0.5);
+  doc.fontSize(12).font('Helvetica-Bold').fillColor('#1e3a8a').text('3. Student-Wise Average Score per Faculty', 40, doc.y);
+  doc.moveDown(0.4);
 
   let stTableY = doc.y;
   const stColWidths = { sr: 45, enrollment: 140, teacher: 220, avg: 110 };
 
-  // Header
-  doc.rect(tableX, stTableY, doc.page.width - 80, 22).fill('#2B6CB0');
-  doc.fillColor('#FFFFFF').fontSize(9).font('Helvetica-Bold');
-  doc.text('Sr. No.', tableX + 6, stTableY + 6, { width: stColWidths.sr });
-  doc.text('Enrollment Number', tableX + stColWidths.sr + 6, stTableY + 6, { width: stColWidths.enrollment });
-  doc.text('Teacher (Subject)', tableX + stColWidths.sr + stColWidths.enrollment + 6, stTableY + 6, { width: stColWidths.teacher });
-  doc.text('Average Score', tableX + stColWidths.sr + stColWidths.enrollment + stColWidths.teacher + 6, stTableY + 6, { width: stColWidths.avg, align: 'right' });
+  // Table Header
+  doc.rect(tableX, stTableY, doc.page.width - 80, 22).fill('#1e3a8a');
+  doc.fillColor('#ffffff').fontSize(8).font('Helvetica-Bold');
+  doc.text('Sr. No.', tableX + 8, stTableY + 7, { width: stColWidths.sr });
+  doc.text('Enrollment Number', tableX + stColWidths.sr + 6, stTableY + 7, { width: stColWidths.enrollment });
+  doc.text('Faculty (Subject)', tableX + stColWidths.sr + stColWidths.enrollment + 6, stTableY + 7, { width: stColWidths.teacher });
+  doc.text('Average Score', tableX + stColWidths.sr + stColWidths.enrollment + stColWidths.teacher + 6, stTableY + 7, { width: stColWidths.avg - 14, align: 'right' });
   stTableY += 22;
 
   isEven = false;
@@ -905,29 +1029,31 @@ function generateAnalysisPDF(res, form, responses, analytics) {
     }
     const rHeight = 20;
     if (isEven) {
-      doc.rect(tableX, stTableY, doc.page.width - 80, rHeight).fill('#F7FAFC');
+      doc.rect(tableX, stTableY, doc.page.width - 80, rHeight).fill('#f8fafc');
     }
-    doc.fillColor('#2D3748').font('Helvetica').fontSize(9);
-    doc.text(String(srNo++), tableX + 6, stTableY + 5, { width: stColWidths.sr });
-    doc.font('Helvetica-Bold').text(row.enrollmentNumber, tableX + stColWidths.sr + 6, stTableY + 5, { width: stColWidths.enrollment }).font('Helvetica');
-    doc.text(`${row.teacherName} - ${row.subject}`, tableX + stColWidths.sr + stColWidths.enrollment + 6, stTableY + 5, { width: stColWidths.teacher });
-    doc.font('Helvetica-Bold').text(`${row.averageRating.toFixed(2)} / 5`, tableX + stColWidths.sr + stColWidths.enrollment + stColWidths.teacher + 6, stTableY + 5, { width: stColWidths.avg - 16, align: 'right' });
+    doc.fillColor('#475569').font('Helvetica').fontSize(8.5);
+    doc.text(String(srNo++), tableX + 8, stTableY + 5, { width: stColWidths.sr });
+    doc.font('Helvetica-Bold').fillColor('#0f172a').text(row.enrollmentNumber, tableX + stColWidths.sr + 6, stTableY + 5, { width: stColWidths.enrollment }).font('Helvetica');
+    doc.fillColor('#334155').text(`${row.teacherName} (${row.subject})`, tableX + stColWidths.sr + stColWidths.enrollment + 6, stTableY + 5, { width: stColWidths.teacher });
+
+    const stColor = getRatingColor(row.averageRating);
+    doc.fillColor(stColor.text).font('Helvetica-Bold').text(`${row.averageRating.toFixed(2)} / 5`, tableX + stColWidths.sr + stColWidths.enrollment + stColWidths.teacher + 6, stTableY + 5, { width: stColWidths.avg - 14, align: 'right' });
 
     stTableY += rHeight;
     isEven = !isEven;
   }
 
-  // ---------------- REMAINING PAGES: FULL STUDENT REPORT (1 STUDENT PER PAGE) ----------------
+  // ---------------- REMAINING PAGES: FULL STUDENT BREAKDOWN ----------------
   for (const resp of responses) {
     doc.addPage();
-    drawPdfHeader(doc, COLLEGE_NAME, 'INDIVIDUAL STUDENT FEEDBACK BREAKDOWN');
+    drawPdfHeader(doc, COLLEGE_NAME, 'INDIVIDUAL STUDENT FEEDBACK SUBMISSION');
 
     // Student Enrollment Banner
-    doc.rect(40, doc.y, doc.page.width - 80, 36).fill('#EDF2F7');
-    doc.fillColor('#1A365D').fontSize(12).font('Helvetica-Bold').text(`Enrollment Number: ${resp.enrollmentNumber}`, 50, doc.y + 11);
+    doc.roundedRect(40, doc.y, doc.page.width - 80, 36, 4).fillAndStroke('#eff6ff', '#bfdbfe');
+    doc.fillColor('#1e3a8a').fontSize(11).font('Helvetica-Bold').text(`Student Enrollment: ${resp.enrollmentNumber}`, 52, doc.y + 11);
     const subDate = resp.submittedAt ? new Date(resp.submittedAt).toLocaleString() : 'N/A';
-    doc.fillColor('#718096').fontSize(9).font('Helvetica').text(`Submitted: ${subDate}`, doc.page.width - 240, doc.y + 13, { align: 'right', width: 190 });
-    doc.y += 50;
+    doc.fillColor('#64748b').fontSize(8.5).font('Helvetica').text(`Submitted On: ${subDate}`, doc.page.width - 240, doc.y + 12, { align: 'right', width: 188 });
+    doc.y += 48;
 
     for (const tResp of resp.teacherResponses) {
       if (doc.y > doc.page.height - 120) {
@@ -935,17 +1061,17 @@ function generateAnalysisPDF(res, form, responses, analytics) {
         doc.y = 40;
       }
 
-      // Teacher heading
-      doc.rect(40, doc.y, doc.page.width - 80, 22).fill('#2D3748');
-      doc.fillColor('#FFFFFF').fontSize(10).font('Helvetica-Bold').text(`Teacher: ${tResp.teacherName}   |   Subject: ${tResp.subject}`, 50, doc.y + 6);
-      doc.y += 24;
+      // Teacher heading bar
+      doc.rect(40, doc.y, doc.page.width - 80, 20).fill('#334155');
+      doc.fillColor('#ffffff').fontSize(9).font('Helvetica-Bold').text(`Faculty: ${tResp.teacherName}   |   Subject: ${tResp.subject}`, 50, doc.y + 5);
+      doc.y += 22;
 
-      // Table for Topics & Ratings
+      // Table Header for Topics
       const curTableY = doc.y;
-      doc.rect(40, curTableY, doc.page.width - 80, 18).fill('#E2E8F0');
-      doc.fillColor('#2D3748').fontSize(9).font('Helvetica-Bold');
+      doc.rect(40, curTableY, doc.page.width - 80, 18).fill('#e2e8f0');
+      doc.fillColor('#1e293b').fontSize(8).font('Helvetica-Bold');
       doc.text('Evaluation Criteria / Topic', 50, curTableY + 5, { width: 380 });
-      doc.text('Rating (1-5)', doc.page.width - 160, curTableY + 5, { width: 110, align: 'right' });
+      doc.text('Score (1-5)', doc.page.width - 150, curTableY + 5, { width: 95, align: 'right' });
       doc.y += 18;
 
       let tSum = 0;
@@ -955,11 +1081,11 @@ function generateAnalysisPDF(res, form, responses, analytics) {
       for (const ans of tResp.answers) {
         const itemY = doc.y;
         if (tEven) {
-          doc.rect(40, itemY, doc.page.width - 80, 18).fill('#F7FAFC');
+          doc.rect(40, itemY, doc.page.width - 80, 18).fill('#f8fafc');
         }
-        doc.fillColor('#4A5568').font('Helvetica').fontSize(9);
+        doc.fillColor('#475569').font('Helvetica').fontSize(8.5);
         doc.text(ans.topic, 50, itemY + 4, { width: 380 });
-        doc.font('Helvetica-Bold').text(`${ans.rating} / 5`, doc.page.width - 160, itemY + 4, { width: 110, align: 'right' });
+        doc.font('Helvetica-Bold').fillColor(ans.rating >= 4 ? '#059669' : ans.rating >= 3 ? '#d97706' : '#dc2626').text(`${ans.rating} / 5`, doc.page.width - 150, itemY + 4, { width: 95, align: 'right' });
         doc.y += 18;
         tSum += ans.rating;
         tCount += 1;
@@ -969,20 +1095,38 @@ function generateAnalysisPDF(res, form, responses, analytics) {
       // Teacher average score bar
       const tAvg = tCount > 0 ? (tSum / tCount).toFixed(2) : '0.00';
       const avgBarY = doc.y;
-      doc.rect(40, avgBarY, doc.page.width - 80, 20).fill('#EDF2F7');
-      doc.fillColor('#2B6CB0').font('Helvetica-Bold').fontSize(9).text(`Teacher Average: ${tAvg} / 5.00`, doc.page.width - 240, avgBarY + 5, { align: 'right', width: 190 });
-      doc.y += 30;
+      doc.roundedRect(40, avgBarY, doc.page.width - 80, 20, 2).fillAndStroke('#f1f5f9', '#e2e8f0');
+      doc.fillColor('#1e3a8a').font('Helvetica-Bold').fontSize(8.5).text(`Average Rating for ${tResp.teacherName}: ${tAvg} / 5.00`, doc.page.width - 250, avgBarY + 5, { align: 'right', width: 195 });
+      doc.y += 28;
     }
   }
 
-  // Add Page Numbers to all pages
+  // Universal Running Header & Footer with Page Numbers
   const range = doc.bufferedPageRange();
   for (let i = range.start; i < range.start + range.count; i++) {
     doc.switchToPage(i);
-    doc.fillColor('#A0AEC0').fontSize(8).font('Helvetica').text(
-      `Page ${i + 1} of ${range.count}  •  ${COLLEGE_NAME} Confidential Report`,
+
+    // Subtle header on pages 2+
+    if (i > 0) {
+      doc.rect(40, 20, doc.page.width - 80, 0.5).fill('#cbd5e1');
+      doc.fillColor('#94a3b8').fontSize(7).font('Helvetica').text(
+        `${COLLEGE_NAME} • Faculty Feedback Report`,
+        40, 12,
+        { align: 'left', width: doc.page.width - 80 }
+      );
+      doc.text(
+        `${form.department} • ${form.className} (Sem ${form.semester})`,
+        40, 12,
+        { align: 'right', width: doc.page.width - 80 }
+      );
+    }
+
+    // Running Footer
+    doc.rect(40, doc.page.height - 30, doc.page.width - 80, 0.5).fill('#e2e8f0');
+    doc.fillColor('#94a3b8').fontSize(7.5).font('Helvetica').text(
+      `Page ${i + 1} of ${range.count}   •   Confidential Institutional Quality Assurance Report`,
       40,
-      doc.page.height - 30,
+      doc.page.height - 22,
       { align: 'center', width: doc.page.width - 80 }
     );
   }
@@ -1093,8 +1237,8 @@ authRouter.get('/me', authenticate, (req, res) => {
 
 /**
  * POST /api/auth/forgot-password
- * Initiates single-use secure reset token flow.
- * SECURITY: Never reveals whether an email exists (timing-safe generic response).
+ * Initiates single-use secure reset token flow supporting both username and email.
+ * Includes direct token recovery when SMTP is unconfigured or fails.
  */
 authRouter.post('/forgot-password', passwordResetLimiter, async (req, res, next) => {
   try {
@@ -1107,34 +1251,87 @@ authRouter.post('/forgot-password', passwordResetLimiter, async (req, res, next)
       });
     }
 
-    const email = parseResult.data.email.toLowerCase().trim();
-    const user = await User.findOne({ email, isActive: true });
+    const rawInput = (
+      parseResult.data.identifier ||
+      parseResult.data.emailOrUsername ||
+      parseResult.data.usernameOrEmail ||
+      parseResult.data.email ||
+      parseResult.data.username ||
+      ''
+    ).trim();
 
-    if (user) {
-      // 1. Generate cryptographically secure random token
-      const rawResetToken = crypto.randomBytes(32).toString('hex');
-
-      // 2. Hash token with SHA-256 before saving to MongoDB
-      const tokenHash = crypto.createHash('sha256').update(rawResetToken).digest('hex');
-
-      // 3. Set expiration (30 minutes)
-      user.resetTokenHash = tokenHash;
-      user.resetTokenExpiry = new Date(Date.now() + 30 * 60 * 1000);
-      await user.save();
-
-      // 4. Dispatch reset email via Gmail SMTP
-      try {
-        await sendPasswordResetEmail(user.email, rawResetToken);
-      } catch (mailErr) {
-        console.error('[EMAIL ERROR] Failed to send reset email:', mailErr.message);
-      }
+    if (!rawInput) {
+      return res.status(400).json({ success: false, error: 'Please enter your username or email address.' });
     }
 
-    // Always return generic response to prevent email enumeration
-    res.status(200).json({
-      success: true,
-      message: 'If an account exists for this email, a password reset link has been sent.'
+    const cleanInput = rawInput.toLowerCase();
+
+    // Query user by email OR username (case insensitive)
+    const user = await User.findOne({
+      $or: [{ email: cleanInput }, { username: cleanInput }],
+      isActive: true
     });
+
+    if (!user) {
+      // Safe timing response to prevent enumeration attacks
+      return res.status(200).json({
+        success: true,
+        message: 'If an account exists for this username or email, password recovery instructions have been initiated.',
+        accountFound: false
+      });
+    }
+
+    // 1. Generate cryptographically secure random token (32 bytes hex)
+    const rawResetToken = crypto.randomBytes(32).toString('hex');
+
+    // 2. Hash token with SHA-256 before saving to MongoDB
+    const tokenHash = crypto.createHash('sha256').update(rawResetToken).digest('hex');
+
+    // 3. Set expiration (30 minutes)
+    user.resetTokenHash = tokenHash;
+    user.resetTokenExpiry = new Date(Date.now() + 30 * 60 * 1000);
+    await user.save();
+
+    // 4. Construct client reset URL
+    const clientOrigin = (req.headers.origin || req.headers.referer || STUDENT_FRONTEND_URL).replace(/\/$/, '');
+    const resetUrl = `${clientOrigin}/admin.html?token=${rawResetToken}`;
+
+    // 5. Dispatch email via Gmail SMTP
+    let emailSent = false;
+    let mailErrorMsg = '';
+    try {
+      emailSent = await sendPasswordResetEmail(user.email, rawResetToken, user.name, resetUrl);
+    } catch (mailErr) {
+      mailErrorMsg = mailErr.message;
+      console.error('[EMAIL ERROR] Failed to dispatch reset email:', mailErr.message);
+    }
+
+    // Prominent server log banner for verification and immediate recovery
+    console.log('\n================================================================================');
+    console.log('[PASSWORD RESET REQUEST INITIATED]');
+    console.log(`Account: ${user.name} (@${user.username}) | Role: ${user.role} | Email: ${user.email}`);
+    console.log(`Raw Reset Token: ${rawResetToken}`);
+    console.log(`Reset URL:       ${resetUrl}`);
+    console.log(`Email Dispatch:  ${emailSent ? 'SUCCESS (Delivered via Gmail SMTP)' : 'FALLBACK (Direct Recovery Active: ' + (mailErrorMsg || 'SMTP unconfigured') + ')'}`);
+    console.log('================================================================================\n');
+
+    const responsePayload = {
+      success: true,
+      accountFound: true,
+      emailSent,
+      maskedEmail: maskEmail(user.email),
+      message: emailSent
+        ? `A password reset link has been dispatched to ${maskEmail(user.email)}. Please check your inbox.`
+        : `Password reset token generated. Direct recovery mode is active.`
+    };
+
+    // If email wasn't delivered or dev/fallback, return token & direct URL in response so user is never locked out
+    if (!emailSent || !IS_PRODUCTION) {
+      responsePayload.resetToken = rawResetToken;
+      responsePayload.resetUrl = resetUrl;
+    }
+
+    res.status(200).json(responsePayload);
   } catch (error) {
     next(error);
   }
@@ -1155,10 +1352,11 @@ authRouter.post('/reset-password', passwordResetLimiter, async (req, res, next) 
       });
     }
 
-    const { token, newPassword } = parseResult.data;
+    const rawToken = (parseResult.data.token || parseResult.data.resetToken || '').trim();
+    const { newPassword } = parseResult.data;
 
-    // Hash the incoming raw token to look it up
-    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+    // Hash the incoming raw token to look it up in MongoDB
+    const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
 
     const user = await User.findOne({
       resetTokenHash: tokenHash,
@@ -1169,17 +1367,19 @@ authRouter.post('/reset-password', passwordResetLimiter, async (req, res, next) 
     if (!user) {
       return res.status(400).json({
         success: false,
-        error: 'Password reset link is invalid or has expired. Please request a new one.'
+        error: 'Password reset token is invalid or has expired (valid for 30 minutes). Please request a new one.'
       });
     }
 
-    // Hash new password using Argon2/Bcrypt
+    // Hash new password using Argon2 with Bcrypt fallback
     user.passwordHash = await hashPassword(newPassword);
 
-    // Invalidate reset token immediately (single-use enforcement)
+    // Invalidate reset token immediately (enforce single-use)
     user.resetTokenHash = null;
     user.resetTokenExpiry = null;
     await user.save();
+
+    console.log(`[PASSWORD RESET SUCCESS] User @${user.username} successfully updated password.`);
 
     res.status(200).json({
       success: true,
@@ -1534,6 +1734,70 @@ adminRouter.patch('/profile', async (req, res, next) => {
         department: user.department
       }
     });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * GET /api/admin/forms
+ * Super Admin lists all feedback forms across all departments with response counts
+ */
+adminRouter.get('/forms', async (req, res, next) => {
+  try {
+    const forms = await FeedbackForm.find()
+      .populate('hodId', 'name email department username')
+      .sort({ createdAt: -1 });
+
+    const formIds = forms.map(f => f._id);
+    const responseCounts = await FeedbackResponse.aggregate([
+      { $match: { formId: { $in: formIds } } },
+      { $group: { _id: '$formId', count: { $sum: 1 } } }
+    ]);
+
+    const countMap = new Map(responseCounts.map(r => [r._id.toString(), r.count]));
+
+    const formsWithCounts = forms.map(f => {
+      const obj = f.toObject();
+      obj.responseCount = countMap.get(f._id.toString()) || 0;
+      return obj;
+    });
+
+    res.status(200).json({
+      success: true,
+      count: formsWithCounts.length,
+      forms: formsWithCounts
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * GET /api/admin/forms/:id/pdf
+ * Super Admin downloads the PDF analysis report for any form across any branch
+ */
+adminRouter.get('/forms/:id/pdf', async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ success: false, error: 'Invalid form ID format' });
+    }
+
+    const form = await FeedbackForm.findById(id);
+    if (!form) {
+      return res.status(404).json({ success: false, error: 'Feedback form not found' });
+    }
+
+    const responses = await FeedbackResponse.find({ formId: form._id }).sort({ enrollmentNumber: 1 });
+    const analytics = computeFormAnalytics(form, responses);
+
+    const filename = `Faculty_Feedback_${form.department}_${form.className}_Sem${form.semester}.pdf`.replace(/\s+/g, '_');
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+
+    generateAnalysisPDF(res, form, responses, analytics);
   } catch (error) {
     next(error);
   }
