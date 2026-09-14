@@ -53,10 +53,10 @@ dotenv.config();
 const PORT = process.env.PORT || 5000;
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/college_feedback_db';
 const AUTH_SECRET = process.env.AUTH_SECRET || 'fallback_development_secret_key_change_in_production';
-const GMAIL_USER = process.env.GMAIL_USER || '';
-const GMAIL_APP_PASSWORD = process.env.GMAIL_APP_PASSWORD || '';
+const GMAIL_USER = (process.env.GMAIL_USER || '').trim();
+const GMAIL_APP_PASSWORD = (process.env.GMAIL_APP_PASSWORD || '').replace(/\s+/g, '');
 const STUDENT_FRONTEND_URL = (process.env.STUDENT_FRONTEND_URL || 'http://localhost:3000').replace(/\/$/, '');
-const COLLEGE_NAME = process.env.COLLEGE_NAME || 'College Faculty Feedback System';
+const COLLEGE_NAME = process.env.COLLEGE_NAME || 'Maulana Azad Polytechnic, Solapur';
 const NODE_ENV = process.env.NODE_ENV || 'development';
 const IS_PRODUCTION = NODE_ENV === 'production';
 
@@ -387,10 +387,10 @@ const authLimiter = rateLimit({
 
 const passwordResetLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 5,
+  max: 50,
   standardHeaders: true,
   legacyHeaders: false,
-  message: { success: false, error: 'Too many password reset attempts. Please try again later.' }
+  message: { success: false, error: 'Too many password reset requests from this network. Please wait 15 minutes before trying again.' }
 });
 
 const submissionLimiter = rateLimit({
@@ -599,9 +599,15 @@ if (GMAIL_USER && GMAIL_APP_PASSWORD) {
   try {
     emailTransporter = nodemailer.createTransport({
       service: 'gmail',
+      host: 'smtp.gmail.com',
+      port: 465,
+      secure: true,
       auth: {
         user: GMAIL_USER,
         pass: GMAIL_APP_PASSWORD
+      },
+      tls: {
+        rejectUnauthorized: false
       }
     });
 
@@ -628,8 +634,9 @@ function maskEmail(email) {
 
 async function sendPasswordResetEmail(recipientEmail, rawToken, recipientName = 'User', customResetUrl = null) {
   if (!emailTransporter) {
-    console.warn('[EMAIL NOTICE] Gmail SMTP is not configured. Direct token recovery in effect. Token:', rawToken);
-    return false;
+    const errorMsg = 'Gmail SMTP is not configured (GMAIL_USER or GMAIL_APP_PASSWORD missing in Render environment variables).';
+    console.warn('[EMAIL NOTICE]', errorMsg, 'Direct token recovery active. Token:', rawToken);
+    return { success: false, reason: errorMsg };
   }
 
   const resetUrl = customResetUrl || `${STUDENT_FRONTEND_URL}/admin.html?token=${encodeURIComponent(rawToken)}`;
@@ -688,8 +695,14 @@ async function sendPasswordResetEmail(recipientEmail, rawToken, recipientName = 
     `
   };
 
-  await emailTransporter.sendMail(mailOptions);
-  return true;
+  try {
+    const info = await emailTransporter.sendMail(mailOptions);
+    console.log('[EMAIL SUCCESS] Password reset email sent to:', recipientEmail, 'MessageId:', info.messageId);
+    return { success: true, messageId: info.messageId };
+  } catch (mailErr) {
+    console.error('[EMAIL ERROR] Failed to send email via SMTP:', mailErr.message);
+    return { success: false, reason: mailErr.message };
+  }
 }
 
 // ============================================================================
@@ -827,15 +840,33 @@ function computeFormAnalytics(form, responses) {
 // 9. PDF REPORT GENERATOR (PDFKit Multi-Page Engine)
 // ============================================================================
 function findCollegeLogoPath() {
-  const possiblePaths = [
-    path.join(__dirname, 'logo.png'),
-    path.join(process.cwd(), 'logo.png'),
-    path.join(__dirname, '..', 'logo.png'),
-    path.join(__dirname, '..', 'scratch', 'logo.png'),
-    path.join(__dirname, 'public', 'logo.png')
+  const fileNames = [
+    'logo.jpeg',
+    'logo.jpg',
+    'logo.png',
+    'Logo.jpeg',
+    'Logo.jpg',
+    'Logo.png',
+    'college_logo.jpeg',
+    'college_logo.jpg',
+    'college_logo.png'
   ];
-  for (const p of possiblePaths) {
-    if (fs.existsSync(p)) return p;
+  const searchDirs = [
+    __dirname,
+    process.cwd(),
+    path.join(__dirname, '..'),
+    path.join(process.cwd(), '..'),
+    path.join(__dirname, '..', 'scratch'),
+    path.join(__dirname, 'public'),
+    path.join(process.cwd(), 'public')
+  ];
+  for (const dir of searchDirs) {
+    for (const name of fileNames) {
+      const fullPath = path.join(dir, name);
+      if (fs.existsSync(fullPath)) {
+        return fullPath;
+      }
+    }
   }
   return null;
 }
@@ -850,32 +881,49 @@ function drawPdfHeader(doc, title, subtitle) {
   const logoPath = findCollegeLogoPath();
 
   // Header Banner Background
-  doc.rect(40, 24, doc.page.width - 80, 58).fill('#1e3a8a');
+  const bannerHeight = 66;
+  doc.rect(40, 22, doc.page.width - 80, bannerHeight).fill('#1e3a8a');
 
   // College Logo or Vector Emblem
   if (logoPath) {
     try {
-      doc.image(logoPath, 52, 30, { fit: [46, 46], align: 'center', valign: 'center' });
+      doc.save();
+      // Draw a neat white rounded container for the college logo
+      doc.roundedRect(48, 27, 54, 54, 6).fill('#ffffff');
+      doc.image(logoPath, 50, 29, { fit: [50, 50], align: 'center', valign: 'center' });
+      doc.restore();
     } catch (e) {
-      doc.roundedRect(52, 30, 46, 46, 6).fill('#2563eb');
-      doc.fillColor('#ffffff').fontSize(16).font('Helvetica-Bold').text('CF', 52, 44, { width: 46, align: 'center' });
+      console.warn('[PDF LOGO NOTICE] Could not embed logo image, falling back to crest emblem:', e.message);
+      doc.roundedRect(48, 27, 54, 54, 6).fill('#2563eb');
+      doc.fillColor('#ffffff').fontSize(16).font('Helvetica-Bold').text('MAP', 48, 45, { width: 54, align: 'center' });
     }
   } else {
-    doc.roundedRect(52, 30, 46, 46, 6).fill('#2563eb');
-    doc.fillColor('#ffffff').fontSize(16).font('Helvetica-Bold').text('CF', 52, 44, { width: 46, align: 'center' });
+    doc.roundedRect(48, 27, 54, 54, 6).fill('#2563eb');
+    doc.fillColor('#ffffff').fontSize(16).font('Helvetica-Bold').text('MAP', 48, 45, { width: 54, align: 'center' });
   }
 
-  // Header Typography
-  doc.fillColor('#ffffff').fontSize(15).font('Helvetica-Bold').text(title, 110, 32, {
-    width: doc.page.width - 160
-  });
-  doc.fillColor('#bfdbfe').fontSize(10).font('Helvetica').text(subtitle, 110, 52, {
-    width: doc.page.width - 160
-  });
+  // Header Typography - Explicitly Maulana Azad Polytechnic, Solapur
+  doc.fillColor('#ffffff').fontSize(13.5).font('Helvetica-Bold').text(
+    'MAULANA AZAD POLYTECHNIC, SOLAPUR',
+    110, 27,
+    { width: doc.page.width - 160 }
+  );
+
+  doc.fillColor('#fde047').fontSize(7.5).font('Helvetica-Bold').text(
+    'APPROVED BY AICTE, NEW DELHI & DTE, GOVT. OF MAHARASHTRA • AFFILIATED TO MSBTE, MUMBAI',
+    110, 45,
+    { width: doc.page.width - 160 }
+  );
+
+  doc.fillColor('#bfdbfe').fontSize(9.5).font('Helvetica').text(
+    subtitle || 'FACULTY FEEDBACK EVALUATION & ANALYTICS REPORT',
+    110, 57,
+    { width: doc.page.width - 160 }
+  );
 
   // Thin Accent Divider
-  doc.rect(40, 82, doc.page.width - 80, 2).fill('#3b82f6');
-  doc.y = 96;
+  doc.rect(40, 88, doc.page.width - 80, 2.5).fill('#3b82f6');
+  doc.y = 100;
 }
 
 function drawMetadataBox(doc, form, totalResponses, overallAvg) {
@@ -1265,19 +1313,31 @@ authRouter.post('/forgot-password', passwordResetLimiter, async (req, res, next)
     }
 
     const cleanInput = rawInput.toLowerCase();
+    const cleanRegex = new RegExp('^' + cleanInput.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$', 'i');
 
-    // Query user by email OR username (case insensitive)
+    // Query user by email OR username with regex fallback
     const user = await User.findOne({
-      $or: [{ email: cleanInput }, { username: cleanInput }],
-      isActive: true
+      $or: [
+        { email: cleanInput },
+        { username: cleanInput },
+        { email: cleanRegex },
+        { username: cleanRegex }
+      ]
     });
 
     if (!user) {
-      // Safe timing response to prevent enumeration attacks
-      return res.status(200).json({
-        success: true,
-        message: 'If an account exists for this username or email, password recovery instructions have been initiated.',
-        accountFound: false
+      return res.status(404).json({
+        success: false,
+        accountFound: false,
+        error: `No user account found matching "${rawInput}". Please verify your username (e.g. 'superadmin') or registered email.`
+      });
+    }
+
+    if (!user.isActive) {
+      return res.status(403).json({
+        success: false,
+        accountFound: false,
+        error: `The account @${user.username} is currently deactivated. Please contact the administrator.`
       });
     }
 
@@ -1300,8 +1360,11 @@ authRouter.post('/forgot-password', passwordResetLimiter, async (req, res, next)
     let emailSent = false;
     let mailErrorMsg = '';
     try {
-      emailSent = await sendPasswordResetEmail(user.email, rawResetToken, user.name, resetUrl);
+      const mailResult = await sendPasswordResetEmail(user.email, rawResetToken, user.name, resetUrl);
+      emailSent = !!mailResult.success;
+      mailErrorMsg = mailResult.reason || '';
     } catch (mailErr) {
+      emailSent = false;
       mailErrorMsg = mailErr.message;
       console.error('[EMAIL ERROR] Failed to dispatch reset email:', mailErr.message);
     }
@@ -1319,17 +1382,17 @@ authRouter.post('/forgot-password', passwordResetLimiter, async (req, res, next)
       success: true,
       accountFound: true,
       emailSent,
+      smtpConfigured: !!emailTransporter,
       maskedEmail: maskEmail(user.email),
+      recipientEmail: user.email,
+      username: user.username,
+      resetToken: rawResetToken, // Always return reset token so the user is never blocked by SMTP issues
+      resetUrl: resetUrl,
+      mailError: mailErrorMsg || undefined,
       message: emailSent
-        ? `A password reset link has been dispatched to ${maskEmail(user.email)}. Please check your inbox.`
-        : `Password reset token generated. Direct recovery mode is active.`
+        ? `Password reset link dispatched to ${maskEmail(user.email)}. Please check your inbox or spam folder.`
+        : `Password recovery token generated. Email notice: ${mailErrorMsg || 'SMTP credentials unconfigured on server'}. Your reset token has been auto-loaded below so you can set a new password immediately.`
     };
-
-    // If email wasn't delivered or dev/fallback, return token & direct URL in response so user is never locked out
-    if (!emailSent || !IS_PRODUCTION) {
-      responsePayload.resetToken = rawResetToken;
-      responsePayload.resetUrl = resetUrl;
-    }
 
     res.status(200).json(responsePayload);
   } catch (error) {
@@ -2463,7 +2526,7 @@ AUTH_SECRET=a_long_cryptographically_secure_random_string_for_jwt_signing
 GMAIL_USER=your_college_notifications@gmail.com
 GMAIL_APP_PASSWORD=xxxx_xxxx_xxxx_xxxx
 STUDENT_FRONTEND_URL=https://your-student-feedback-ui.onrender.com
-COLLEGE_NAME=St. Xavier's College of Engineering
+COLLEGE_NAME=Maulana Azad Polytechnic, Solapur
 
 NOTES:
 1. GMAIL_APP_PASSWORD:
